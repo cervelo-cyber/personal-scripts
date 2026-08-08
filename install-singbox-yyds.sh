@@ -147,7 +147,7 @@ rand_uuid() {
 
 # -----------------------
 # 配置节点名称后缀
-echo "请输入节点名称(留空则默认议名):"
+echo "请输入节点名称(留空则默认协议名):"
 read -r user_name
 if [[ -n "$user_name" ]]; then
     suffix="-${user_name}"
@@ -861,7 +861,7 @@ OPENRC
         
         sleep 2
         if rc-service sing-box status >/dev/null 2>&1; then
-            info "✅ OpenRC 服务已启动"
+            info "OpenRC 服务已启动"
         else
             err "服务状态异常"
             exit 1
@@ -901,7 +901,7 @@ SYSTEMD
         
         sleep 2
         if systemctl is-active sing-box >/dev/null 2>&1; then
-            info "✅ Systemd 服务已启动"
+            info "Systemd 服务已启动"
         else
             err "服务状态异常"
             exit 1
@@ -994,10 +994,10 @@ generate_uris() {
 # 最终输出
 echo ""
 echo "=========================================="
-info "🎉 Sing-box 部署完成!"
+info "Sing-box 部署完成!"
 echo "=========================================="
 echo ""
-info "📋 配置信息:"
+info "配置信息:"
 $ENABLE_SS && echo "   SS 端口: $PORT_SS | 密码: $PSK_SS | 加密: $SS_METHOD"
 $ENABLE_HY2 && echo "   HY2 端口: $PORT_HY2 | 密码: $PSK_HY2"
 $ENABLE_TUIC && echo "   TUIC 端口: $PORT_TUIC | UUID: $UUID_TUIC | 密码: $PSK_TUIC"
@@ -1006,17 +1006,17 @@ $ENABLE_ANYTLS && echo "   AnyTLS 端口: $PORT_ANYTLS | 用户: $ANYTLS_USER | 
 echo "   服务器: $PUB_IP"
 echo "   Reality server_name(SNI): ${REALITY_SNI:-addons.mozilla.org}"
 echo ""
-info "📂 文件位置:"
+info "文件位置:"
 echo "   配置: $CONFIG_PATH"
 ($ENABLE_HY2 || $ENABLE_TUIC) && echo "   证书: /etc/sing-box/certs/"
 echo "   服务: $SERVICE_PATH"
 echo ""
-info "📜 客户端链接:"
+info "客户端链接:"
 generate_uris | while IFS= read -r line; do
     echo "   $line"
 done
 echo ""
-info "🔧 管理命令:"
+info "管理命令:"
 if [ "$OS" = "alpine" ]; then
     echo "   启动: rc-service sing-box start"
     echo "   停止: rc-service sing-box stop"
@@ -1696,13 +1696,13 @@ mkdir -p /etc/sing-box
 echo "$RELAY_URI" > /etc/sing-box/relay_uri.txt
 
 echo ""
-info "✅ 安装完成"
+info "安装完成"
 echo "=============== 中转节点 Reality 链接 ==============="
 echo "$RELAY_URI"
 echo "===================================================="
 echo ""
-info "💡 链接已保存到: /etc/sing-box/relay_uri.txt"
-info "💡 查看链接命令: cat /etc/sing-box/relay_uri.txt"
+info "链接已保存到: /etc/sing-box/relay_uri.txt"
+info "查看链接命令: cat /etc/sing-box/relay_uri.txt"
 RELAY_EOF
 
     # 替换占位符（INBOUND_IP/PORT/METHOD/PASSWORD 同时替换 REALITY_SNI）
@@ -1714,7 +1714,7 @@ RELAY_EOF
     
     chmod +x "$RELAY_SCRIPT"
     
-    info "✅ 线路机脚本已生成: $RELAY_SCRIPT"
+    info "线路机脚本已生成: $RELAY_SCRIPT"
     echo ""
     info "请复制以下内容到线路机执行:"
     echo "----------------------------------------"
@@ -1852,4 +1852,4 @@ SB_SCRIPT
 
 chmod +x "$SB_PATH"
 ln -sf /usr/local/bin/sb /usr/bin/sb
-info "✅ 管理面板已创建,可输入 sb 打开管理面板"
+info "管理面板已创建,可输入 sb 打开管理面板"

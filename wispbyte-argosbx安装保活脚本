@@ -1,0 +1,74 @@
+import subprocess
+import sys
+import os
+import urllib.request
+import time
+import threading
+
+INSTALL_DIR = "/home/container/agsbx"
+SUB_FILE = os.path.join(INSTALL_DIR, "jhsub.txt")
+
+def read_stream(stream, prefix):
+    for line in iter(stream.readline, b''):
+        sys.stdout.write(f"[{prefix}] {line.decode('utf-8')}")
+        sys.stdout.flush()
+
+def already_installed():
+    # 只要聚合节点文件存在，就认为已经装过了，不用重新跑安装脚本
+    return os.path.exists(SUB_FILE)
+
+def show_existing_nodes():
+    print("=== 检测到已安装，直接读取现有节点信息 ===")
+    try:
+        with open(SUB_FILE, "r") as f:
+            print(f.read())
+    except Exception as e:
+        print(f"读取节点信息失败: {e}")
+
+def run_argosbx():
+    env = os.environ.copy()
+    env['vwpt'] = '这里改为被分配到的端口'
+    env['argo'] = 'vwpt'  #vless-ws-enc协议，使用vmess-ws可写“vmpt”
+    # 如果你换成固定隧道，这里加上你自己的 token，例如：
+    # env['agn'] = '你的固定隧道域名'
+    # env['agk'] = '你的固定隧道token'
+
+    script_url = "https://raw.githubusercontent.com/yonggekkk/argosbx/main/argosbx.sh"
+    print("正在下载 argosbx 脚本...")
+    with urllib.request.urlopen(script_url, timeout=30) as response:
+        script_content = response.read().decode('utf-8')
+
+    script_path = "/tmp/argosbx.sh"
+    with open(script_path, 'w') as f:
+        f.write(script_content)
+    subprocess.run(['chmod', '+x', script_path], check=True)
+
+    print("正在执行 argosbx 脚本...")
+    proc = subprocess.Popen(
+        ['bash', script_path],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    t_out = threading.Thread(target=read_stream, args=(proc.stdout, "OUT"), daemon=True)
+    t_err = threading.Thread(target=read_stream, args=(proc.stderr, "ERR"), daemon=True)
+    t_out.start()
+    t_err.start()
+    proc.wait()
+    return proc
+
+if __name__ == "__main__":
+    print("=== 开始执行 main.py ===")
+
+    if already_installed():
+        show_existing_nodes()
+    else:
+        run_argosbx()
+        print("argosbx 脚本执行完成，服务已启动（Xray/Argo 等）。")
+
+    print("进入保活模式，缩短心跳间隔避免被平台判定为空闲/僵死...")
+    counter = 0
+    while True:
+        time.sleep(60)          # 每60秒输出一次,进行保活，避免容器暂停、重启
+        counter += 1
+        print(f"💓 心跳: 容器运行中 ({counter*60}s)")

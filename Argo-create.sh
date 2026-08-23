@@ -21,6 +21,11 @@ ORIGIN_PORT="${ARGO_PORT:-}"
 ARGO_DOMAIN="${ARGO_DOMAIN:-}"
 ARGO_TOKEN="${ARGO_TOKEN:-}"
 
+# cloudflared 默认会与 Cloudflare 边缘建立 4 条高可用连接（--ha-connections 默认值为 4）。
+#4个高可用连接会分配最少两个不同的数据中心
+#4个（不含）以下连接数未知
+HA_CONNECTIONS="4"
+
 log() { printf '[Argo] %s\n' "$*"; }
 warn() { printf '[Argo][WARN] %s\n' "$*" >&2; }
 die() { printf '[Argo][ERROR] %s\n' "$*" >&2; exit 1; }
@@ -43,6 +48,17 @@ cloudflared_bin() { bin_path; }
 
 ensure_state_dir() {
     mkdir -p "$STATE_DIR" || die "无法创建状态目录：$STATE_DIR"
+}
+
+# 掩码显示敏感 Token，仅用于人工核对，不在日志/状态中暴露完整内容
+mask_token() {
+    local t="$1" len
+    len=${#t}
+    if [ "$len" -le 10 ]; then
+        printf '******\n'
+    else
+        printf '%s...%s（长度 %d）\n' "${t:0:6}" "${t: -4}" "$len"
+    fi
 }
 
 save_config() {
@@ -117,7 +133,8 @@ Argo-only：独立 Cloudflare Tunnel 安装/管理脚本
   bash argo-only.sh restart
   bash argo-only.sh status
   bash argo-only.sh show
-  bash argo-only.sh uninstall
+  bash argo-only.sh uninstall     # 完整卸载：停止服务、删除本工具安装的 cloudflared 及所有状态文件
+  bash argo-only.sh cleanup       # 残留清理：仅清理孤立进程/旧缓存/其它同名服务单元，不卸载、不删本脚本
 
 环境变量方式：
   ARGO_MODE=temp ARGO_PORT=10001 bash argo-only.sh install
@@ -132,13 +149,77 @@ HELP
 
 select_mode_interactive() {
     [ -n "$MODE" ] && return 0
-    printf '\n1) 临时 Argo（trycloudflare.com）\n2) 固定 Argo（Zero Trust Token）\n选择 [1-2]: '
-    read -r choice
-    case "$choice" in
-        1) MODE="temp" ;;
-        2) MODE="fixed" ;;
-        *) die "无效选择" ;;
-    esac
+    while true; do
+        printf '\n请选择 Argo 隧道类型：\n'
+        printf '  1) 临时 Argo（trycloudflare.com，无需注册，重启后域名会变化）\n'
+        printf '  2) 固定 Argo（Zero Trust Token，需要自己的域名，域名固定不变）\n'
+        printf '请输入 [1-2]: '
+        read -r choice
+        case "$choice" in
+            1) MODE="temp"; break ;;
+            2) MODE="fixed"; break ;;
+            *) warn "无效选择，请输入 1 或 2" ;;
+        esac
+    done
+}
+
+prompt_port() {
+    local p
+    while true; do
+        printf 'Argo 回源 WS 端口（本机监听的端口，例如 10001）: '
+        read -r p
+        p="$(printf '%s' "$p" | tr -d '[:space:]')"
+        if [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ]; then
+            ORIGIN_PORT="$p"
+            break
+        fi
+        warn "端口无效，必须是 1-65535 之间的数字，请重新输入"
+    done
+}
+
+prompt_domain() {
+    local d
+    while true; do
+        printf '固定 Argo 域名（需已在 Cloudflare Zero Trust 中为该 Tunnel 配置好 Public Hostname，\n例如：argo.example.com）: '
+        read -r d
+        d="$(printf '%s' "$d" | tr -d '[:space:]')"
+        if [ -z "$d" ]; then
+            warn "域名不能为空，请重新输入"
+            continue
+        fi
+        if [[ ! "$d" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,}$ ]]; then
+            warn "域名格式看起来不正确（应类似 argo.example.com），请重新输入"
+            continue
+        fi
+        ARGO_DOMAIN="$d"
+        break
+    done
+}
+
+prompt_token() {
+    local t confirm
+    while true; do
+        printf 'Cloudflare Tunnel Token（在 Zero Trust → Networks → Tunnels 创建隧道后获取，\n通常以 "ey" 开头）。为避免泄露，粘贴后按回车确认，输入内容不会显示: '
+        read -rs t
+        printf '\n'
+        t="$(printf '%s' "$t" | tr -d '[:space:]')"
+        if [ -z "$t" ]; then
+            warn "Token 不能为空，请重新输入"
+            continue
+        fi
+        if [[ "$t" != ey* ]]; then
+            warn "Token 格式看起来不太对（通常以 \"ey\" 开头），请确认是否复制完整"
+            printf '仍然使用该 Token？[y/N]: '
+            read -r confirm
+            case "$confirm" in
+                y|Y) ;;
+                *) continue ;;
+            esac
+        fi
+        ARGO_TOKEN="$t"
+        break
+    done
+    log "已获取 Token（掩码显示：$(mask_token "$ARGO_TOKEN")）"
 }
 
 collect_config() {
@@ -147,25 +228,18 @@ collect_config() {
     case "$MODE" in
         temp|temporary)
             MODE="temp"
-            if [ -z "$ORIGIN_PORT" ]; then
-                printf 'Argo 回源 WS 端口: '
-                read -r ORIGIN_PORT
-            fi
+            [ -z "$ORIGIN_PORT" ] && prompt_port
             [[ "$ORIGIN_PORT" =~ ^[0-9]+$ ]] || die "端口必须是数字"
             [ "$ORIGIN_PORT" -ge 1 ] && [ "$ORIGIN_PORT" -le 65535 ] || die "端口范围必须为 1-65535"
             ;;
         fixed|named)
             MODE="fixed"
-            if [ -z "$ARGO_DOMAIN" ]; then
-                printf '固定 Argo 域名（例如 argo.example.com）: '
-                read -r ARGO_DOMAIN
-            fi
-            if [ -z "$ARGO_TOKEN" ]; then
-                printf 'Cloudflare Tunnel Token（ey...）: '
-                read -r ARGO_TOKEN
-            fi
+            [ -z "$ARGO_DOMAIN" ] && prompt_domain
+            [ -z "$ARGO_TOKEN" ] && prompt_token
             [ -n "$ARGO_DOMAIN" ] || die "固定 Argo 必须提供域名"
             [ -n "$ARGO_TOKEN" ] || die "固定 Argo 必须提供 Token"
+            echo
+            log "配置确认：域名=$ARGO_DOMAIN，Token=$(mask_token "$ARGO_TOKEN")"
             ;;
         *)
             die "--mode 只能是 temp 或 fixed"
@@ -192,6 +266,8 @@ install_cloudflared() {
     log "下载 cloudflared：$url"
     mkdir -p "$(dirname "$bin")" || die "无法创建安装目录：$(dirname "$bin")"
 
+    # 直接流式写盘（curl/wget -o 都不会把整个文件缓冲进内存），下载阶段本身
+    # 没有可压缩的内存占用；真正影响常驻内存的是运行阶段的连接数，见 HA_CONNECTIONS。
     if command -v curl >/dev/null 2>&1; then
         curl -fL --retry 3 --connect-timeout 10 -o "$tmp" "$url" || die "cloudflared 下载失败"
     elif command -v wget >/dev/null 2>&1; then
@@ -212,10 +288,12 @@ build_command() {
     bin="$(cloudflared_bin)"
     case "$MODE" in
         temp)
-            CMD=("$bin" tunnel --url "http://localhost:$ORIGIN_PORT" --edge-ip-version auto --no-autoupdate --protocol http2)
+            CMD=("$bin" tunnel --url "http://localhost:$ORIGIN_PORT" --edge-ip-version auto --no-autoupdate --protocol http2 --ha-connections "$HA_CONNECTIONS")
             ;;
         fixed)
-            CMD=("$bin" tunnel --no-autoupdate --edge-ip-version auto --protocol http2 run --token "$ARGO_TOKEN")
+            # Token 不再作为命令行参数传入，改由 TUNNEL_TOKEN 环境变量提供，
+            # 避免在 `ps aux` 中明文暴露给系统上的其他用户（见 start_direct / install_systemd / install_openrc）。
+            CMD=("$bin" tunnel --no-autoupdate --edge-ip-version auto --protocol http2 --ha-connections "$HA_CONNECTIONS" run)
             ;;
         *) die "未设置有效的 MODE" ;;
     esac
@@ -246,7 +324,11 @@ start_direct() {
 
     build_command
     log "启动 Cloudflared Argo..."
-    nohup "${CMD[@]}" >> "$LOG_FILE" 2>&1 &
+    if [ "$MODE" = "fixed" ]; then
+        TUNNEL_TOKEN="$ARGO_TOKEN" nohup "${CMD[@]}" >> "$LOG_FILE" 2>&1 &
+    else
+        nohup "${CMD[@]}" >> "$LOG_FILE" 2>&1 &
+    fi
     local pid=$!
     echo "$pid" > "$PID_FILE"
     sleep 2
@@ -313,16 +395,22 @@ TimeoutStartSec=0
 WantedBy=multi-user.target
 EOF_SERVICE
     chmod 600 "/etc/systemd/system/${SERVICE_NAME}.service"
-    # Store the exact launch command in a root-readable script. Token is never exposed in ps args by this wrapper.
+    # 启动命令保存在仅 root 可读的 run.sh 中。
+    # - temp 模式：输出重定向进 $LOG_FILE，这样 show_info 才能从日志里抓到 trycloudflare.com 域名
+    #   （旧版本这里没有重定向，systemd 下 stdout/stderr 只会进 journal，$LOG_FILE 永远是空的，
+    #   导致临时域名一直显示"等待生成"，只能自己去翻进程/journalctl，这是本次修复的主要问题）。
+    # - fixed 模式：Token 通过 TUNNEL_TOKEN 环境变量传入，不出现在 --token 命令行参数里，
+    #   因此不会在 `ps aux`（对系统上所有用户可见）中明文暴露。
     if [ "$MODE" = "temp" ]; then
         cat > "$STATE_DIR/run.sh" <<EOF_RUN
 #!/bin/bash
-exec ${bin@Q} tunnel --url ${ORIGIN_URL@Q} --edge-ip-version auto --no-autoupdate --protocol http2
+exec ${bin@Q} tunnel --url ${ORIGIN_URL@Q} --edge-ip-version auto --no-autoupdate --protocol http2 --ha-connections ${HA_CONNECTIONS@Q} >> ${LOG_FILE@Q} 2>&1
 EOF_RUN
     else
         cat > "$STATE_DIR/run.sh" <<EOF_RUN
 #!/bin/bash
-exec ${bin@Q} tunnel --no-autoupdate --edge-ip-version auto --protocol http2 run --token ${ARGO_TOKEN@Q}
+export TUNNEL_TOKEN=${ARGO_TOKEN@Q}
+exec ${bin@Q} tunnel --no-autoupdate --edge-ip-version auto --protocol http2 --ha-connections ${HA_CONNECTIONS@Q} run >> ${LOG_FILE@Q} 2>&1
 EOF_RUN
     fi
     chmod 700 "$STATE_DIR/run.sh"
@@ -351,12 +439,16 @@ start_pre() {
     rm -f "${PID_FILE}"
 }
 EOF_RC
+    # run.sh 内也显式重定向到 $LOG_FILE（与 OpenRC 的 output_log/error_log 指向同一文件，
+    # 不会重复写入），确保无论 OpenRC 版本是否正确接管了子进程输出，日志都能稳定写入，
+    # 从而让 show_info 能抓到临时域名。fixed 模式同样改用 TUNNEL_TOKEN 环境变量传参。
     cat > "$STATE_DIR/run.sh" <<EOF_RUN
 #!/bin/bash
 if [ "$MODE" = "fixed" ]; then
-  exec ${bin@Q} tunnel --no-autoupdate --edge-ip-version auto --protocol http2 run --token ${ARGO_TOKEN@Q}
+  export TUNNEL_TOKEN=${ARGO_TOKEN@Q}
+  exec ${bin@Q} tunnel --no-autoupdate --edge-ip-version auto --protocol http2 --ha-connections ${HA_CONNECTIONS@Q} run >> ${LOG_FILE@Q} 2>&1
 else
-  exec ${bin@Q} tunnel --url ${origin_url@Q} --edge-ip-version auto --no-autoupdate --protocol http2
+  exec ${bin@Q} tunnel --url ${origin_url@Q} --edge-ip-version auto --no-autoupdate --protocol http2 --ha-connections ${HA_CONNECTIONS@Q} >> ${LOG_FILE@Q} 2>&1
 fi
 EOF_RUN
     chmod 700 "$STATE_DIR/run.sh"
@@ -399,6 +491,28 @@ restart_backend() {
     esac
 }
 
+# 临时隧道启动后轮询日志，直到抓到 trycloudflare.com 域名再打印出来，
+# 不再需要用户自己去翻进程/journalctl 查找。最多等待 20 秒。
+wait_for_temp_domain() {
+    [ "$MODE" = "temp" ] || return 0
+    printf '[Argo] 等待 Cloudflare 分配临时域名'
+    local i domain
+    for i in $(seq 1 20); do
+        domain="$(grep -Eo '[A-Za-z0-9.-]+\.trycloudflare\.com' "$LOG_FILE" 2>/dev/null | tail -n1 || true)"
+        if [ -n "$domain" ]; then
+            printf '\n'
+            log "临时域名已生成：https://$domain"
+            return 0
+        fi
+        printf '.'
+        sleep 1
+    done
+    printf '\n'
+    warn "等待超时（20秒），日志中暂未检测到临时域名。"
+    warn "可稍后执行 'bash $(basename "$0") show' 重新查看，或检查日志：$LOG_FILE"
+    warn "如果确认之前运行过旧版本脚本，也可以执行 'bash $(basename "$0") cleanup' 清理残留进程后重试。"
+}
+
 status_backend() {
     local bin
     bin="$(cloudflared_bin)"
@@ -415,7 +529,11 @@ status_backend() {
     fi
     if [ "$MODE" = "fixed" ]; then
         echo "固定域名  : ${ARGO_DOMAIN:-未设置}"
-        echo "Token     : ${ARGO_TOKEN:+已设置}"
+        if [ -n "${ARGO_TOKEN:-}" ]; then
+            echo "Token     : 已设置（$(mask_token "$ARGO_TOKEN")）"
+        else
+            echo "Token     : 未设置"
+        fi
     elif [ "$MODE" = "temp" ]; then
         echo "回源端口  : ${ORIGIN_PORT:-未设置}"
     fi
@@ -446,7 +564,11 @@ show_info() {
     echo "模式      : ${MODE:-未配置}"
     if [ "$MODE" = "fixed" ]; then
         echo "固定域名  : ${ARGO_DOMAIN:-未设置}"
-        echo "Token     : ${ARGO_TOKEN:+已设置}"
+        if [ -n "${ARGO_TOKEN:-}" ]; then
+            echo "Token     : 已设置（$(mask_token "$ARGO_TOKEN")）"
+        else
+            echo "Token     : 未设置"
+        fi
         echo
         echo "注意：固定 Tunnel 的公网 Hostname → 本机 WS 端口，需要在"
         echo "Cloudflare Zero Trust → Networks → Tunnels → Routes 中配置。"
@@ -454,7 +576,7 @@ show_info() {
         echo "回源地址  : http://localhost:${ORIGIN_PORT:-}"
         local domain
         domain="$(grep -Eo '[A-Za-z0-9.-]+\.trycloudflare\.com' "$LOG_FILE" 2>/dev/null | tail -n1 || true)"
-        echo "临时域名  : ${domain:-等待 cloudflared 日志生成}"
+        echo "临时域名  : ${domain:-等待 cloudflared 日志生成，可稍后重新执行 show 查看}"
     fi
     echo "日志      : $LOG_FILE"
 }
@@ -465,7 +587,11 @@ install_all() {
     install_cloudflared
     save_config
     install_backend
-    sleep 3
+    if [ "$MODE" = "temp" ]; then
+        wait_for_temp_domain
+    else
+        sleep 3
+    fi
     status_backend
     show_info
 }
@@ -492,6 +618,122 @@ uninstall_all() {
     log "Argo-only 已卸载"
 }
 
+# 残留清理：仅清理"不受当前配置管理"的孤立进程、旧缓存目录、以及可能由旧版本
+# 脚本留下的其它同名/相似 systemd 单元。不会：
+#   - 删除本脚本文件本身
+#   - 删除当前正常安装的 cloudflared 可执行文件
+#   - 停止当前正在正常运行、受本脚本管理的服务
+# 每一步删除/终止操作都会先列出内容并询问确认，避免误伤系统上其它无关的 cloudflared 用途。
+cleanup_residue() {
+    load_config
+    log "开始清理 Argo 残留进程与缓存（不会删除本脚本，也不会影响当前正常运行的 Argo 服务）"
+    echo
+
+    local active_pid=""
+    [ -f "$PID_FILE" ] && active_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+
+    # 1) 扫描残留 cloudflared 进程（排除当前受管 PID），逐个确认后终止
+    log "第 1 步：扫描残留的 cloudflared 进程..."
+    if command -v pgrep >/dev/null 2>&1; then
+        local pids pid cmd found=0 ans
+        # 用 -x 按精确进程名匹配（而不是 -f 匹配整条命令行），避免误伤命令行里
+        # 恰好包含 "cloudflared"/"tunnel" 字样的无关进程（例如某个正在编辑本脚本的编辑器）
+        pids="$(pgrep -x cloudflared 2>/dev/null || true)"
+        for pid in $pids; do
+            [ -n "$active_pid" ] && [ "$pid" = "$active_pid" ] && continue
+            cmd="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+            [ -z "$cmd" ] && continue
+            found=1
+            printf '发现进程 PID=%s：%s\n' "$pid" "$cmd"
+            printf '是否终止该进程？[y/N]: '
+            read -r ans
+            case "$ans" in
+                y|Y)
+                    kill -TERM "$pid" 2>/dev/null || true
+                    sleep 1
+                    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+                    log "已终止 PID=$pid"
+                    ;;
+                *) log "跳过 PID=$pid" ;;
+            esac
+        done
+        [ "$found" = "0" ] && log "未发现残留 cloudflared 进程"
+    else
+        warn "系统缺少 pgrep 命令，跳过残留进程扫描"
+    fi
+    echo
+
+    # 2) 清理失效 PID 文件
+    log "第 2 步：清理失效 PID 文件..."
+    if [ -f "$PID_FILE" ] && ! is_running; then
+        rm -f "$PID_FILE"
+        log "已清理失效 PID 文件"
+    else
+        log "无需清理"
+    fi
+    echo
+
+    # 3) 可选清空日志文件
+    log "第 3 步：日志文件..."
+    if [ -f "$LOG_FILE" ]; then
+        printf '是否清空日志文件 %s？[y/N]: ' "$LOG_FILE"
+        read -r ans
+        case "$ans" in
+            y|Y) : > "$LOG_FILE"; log "日志已清空" ;;
+            *) log "保留日志文件" ;;
+        esac
+    else
+        log "日志文件不存在，跳过"
+    fi
+    echo
+
+    # 4) 扫描历史 cloudflared 缓存目录（可能由手动操作或旧脚本产生的 cert.pem 等）
+    log "第 4 步：扫描历史 cloudflared 缓存目录..."
+    local cache_dirs=("$HOME/.cloudflared" "/etc/cloudflared" "/root/.cloudflared")
+    local d ans
+    for d in "${cache_dirs[@]}"; do
+        [ -d "$d" ] || continue
+        printf '发现缓存目录：%s（内容：%s）\n' "$d" "$(ls -A "$d" 2>/dev/null | tr '\n' ' ')"
+        printf '是否删除该目录？[y/N]: '
+        read -r ans
+        case "$ans" in
+            y|Y) rm -rf "$d"; log "已删除 $d" ;;
+            *) log "保留 $d" ;;
+        esac
+    done
+    echo
+
+    # 5) 扫描名称包含 argo/cloudflared 的其它 systemd 单元（排除当前受管单元）
+    if is_root && command -v systemctl >/dev/null 2>&1; then
+        log "第 5 步：扫描其它可能相关的 systemd 单元..."
+        local units u unit_path ans
+        units="$(systemctl list-unit-files 2>/dev/null | grep -iE 'argo|cloudflared' | awk '{print $1}' || true)"
+        if [ -n "$units" ]; then
+            for u in $units; do
+                [ "$u" = "${SERVICE_NAME}.service" ] && continue
+                printf '发现单元：%s\n' "$u"
+                printf '是否停用并删除该单元？[y/N]: '
+                read -r ans
+                case "$ans" in
+                    y|Y)
+                        systemctl disable --now "$u" >/dev/null 2>&1 || true
+                        unit_path="$(systemctl show -p FragmentPath --value "$u" 2>/dev/null || true)"
+                        [ -n "$unit_path" ] && [ -f "$unit_path" ] && rm -f "$unit_path"
+                        log "已移除 $u"
+                        ;;
+                    *) log "保留 $u" ;;
+                esac
+            done
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        else
+            log "未发现其它相关单元"
+        fi
+        echo
+    fi
+
+    log "残留清理完成。cloudflared 主程序、当前受管服务与本脚本均未被删除。"
+}
+
 main() {
     parse_args "$@"
     case "$ACTION" in
@@ -509,6 +751,8 @@ main() {
             ;;
         uninstall|del)
             uninstall_all ;;
+        cleanup|clean)
+            cleanup_residue ;;
         *)
             usage
             exit 1

@@ -22,9 +22,7 @@ ARGO_DOMAIN="${ARGO_DOMAIN:-}"
 ARGO_TOKEN="${ARGO_TOKEN:-}"
 
 # cloudflared 默认会与 Cloudflare 边缘建立 4 条高可用连接（--ha-connections 默认值为 4）。
-# 对个人单机场景来说这是不必要的开销，官方 issue 中实测把连接数降到 1 条后，
-# 带宽与常驻内存占用都明显下降。这里固定为 1，如需更高可用性可自行修改。
-HA_CONNECTIONS="1"
+HA_CONNECTIONS="4"
 
 log() { printf '[Argo] %s\n' "$*"; }
 warn() { printf '[Argo][WARN] %s\n' "$*" >&2; }

@@ -22,13 +22,74 @@ ARGO_DOMAIN="${ARGO_DOMAIN:-}"
 ARGO_TOKEN="${ARGO_TOKEN:-}"
 
 # cloudflared 默认会与 Cloudflare 边缘建立 4 条高可用连接（--ha-connections 默认值为 4）。
-#4个高可用连接会分配最少两个不同的数据中心
-#4个（不含）以下连接数未知
-HA_CONNECTIONS="4"
+# 对个人单机场景来说这是不必要的开销，官方 issue 中实测把连接数降到 1 条后，
+# 带宽与常驻内存占用都明显下降。这里固定为 1，如需更高可用性可自行修改。
+HA_CONNECTIONS="1"
 
 log() { printf '[Argo] %s\n' "$*"; }
 warn() { printf '[Argo][WARN] %s\n' "$*" >&2; }
 die() { printf '[Argo][ERROR] %s\n' "$*" >&2; exit 1; }
+
+# 交互式读取统一走这里。如果脚本本身是被别的脚本/管道调用的（比如 curl|bash，
+# 或者被其它安装脚本 source/嵌套执行），stdin 可能不是真正的终端、甚至已经 EOF。
+# 这种情况下裸的 `read -r x` 会瞬间返回空字符串且不等待，导致下面的 case 分支
+# 永远匹配不到有效选项、一直重试，从而在原地死循环刷屏（就是你截图里的现象）。
+# 这里优先从真实控制终端 /dev/tty 读取，绕开被占用/关闭的 stdin；如果连 /dev/tty
+# 也不可用（完全非交互环境，比如 cron 或某些容器场景），读取会明确失败，调用方
+# 据此直接退出并给出提示，而不是继续空转。
+TTY_SRC="/dev/tty"
+# -r/-w 只检查权限位，即使没有控制终端、打开会失败（ENXIO: No such device or address）
+# 权限位也可能显示"可读可写"，所以这里改成真正尝试打开一次才算数。
+if ! ( exec 3<"$TTY_SRC" ) 2>/dev/null; then
+    TTY_SRC=""
+fi
+
+# 用法：safe_read [-s] var_name    （-s 表示隐藏输入，用于密码/Token）
+# 返回非 0 表示彻底读不到输入（没有可用终端、或已到输入末尾），调用方必须据此
+# 退出/中止，不能无视返回值继续循环。
+safe_read() {
+    local silent=0
+    if [ "${1:-}" = "-s" ]; then
+        silent=1
+        shift
+    fi
+    local __var="$1" __val="" rc=1
+    if [ -n "$TTY_SRC" ]; then
+        if [ "$silent" = "1" ]; then read -rs __val < "$TTY_SRC"; rc=$?
+        else read -r __val < "$TTY_SRC"; rc=$?
+        fi
+    else
+        if [ "$silent" = "1" ]; then read -rs __val; rc=$?
+        else read -r __val; rc=$?
+        fi
+    fi
+    printf -v "$__var" '%s' "$__val"
+    return $rc
+}
+
+no_tty_die() {
+    die "当前环境读取不到交互输入（没有可用终端，常见于脚本被管道/其它脚本调用、
+或在完全自动化的环境里执行）。请改用参数或环境变量直接指定配置，避免交互式提问，例如：
+  bash $(basename "$0") install --mode temp --port 10001
+  bash $(basename "$0") install --mode fixed --domain argo.example.com --token 'eyJ...'
+或：
+  ARGO_MODE=temp ARGO_PORT=10001 bash $(basename "$0") install"
+}
+
+# 用于 cleanup 等"确认后才执行破坏性操作"的场景：没有可交互终端时，安全默认为
+# 不执行（返回 1 / 视为 N），不会当成"回车确认"，也不会陷入循环。
+confirm_action() {
+    local prompt="$1" ans
+    if [ -z "$TTY_SRC" ]; then
+        return 1
+    fi
+    printf '%s' "$prompt"
+    safe_read ans || return 1
+    case "$ans" in
+        y|Y) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "缺少命令：$1"; }
 
@@ -149,12 +210,13 @@ HELP
 
 select_mode_interactive() {
     [ -n "$MODE" ] && return 0
+    local choice
     while true; do
         printf '\n请选择 Argo 隧道类型：\n'
         printf '  1) 临时 Argo（trycloudflare.com，无需注册，重启后域名会变化）\n'
         printf '  2) 固定 Argo（Zero Trust Token，需要自己的域名，域名固定不变）\n'
         printf '请输入 [1-2]: '
-        read -r choice
+        safe_read choice || no_tty_die
         case "$choice" in
             1) MODE="temp"; break ;;
             2) MODE="fixed"; break ;;
@@ -167,7 +229,7 @@ prompt_port() {
     local p
     while true; do
         printf 'Argo 回源 WS 端口（本机监听的端口，例如 10001）: '
-        read -r p
+        safe_read p || no_tty_die
         p="$(printf '%s' "$p" | tr -d '[:space:]')"
         if [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ]; then
             ORIGIN_PORT="$p"
@@ -181,7 +243,7 @@ prompt_domain() {
     local d
     while true; do
         printf '固定 Argo 域名（需已在 Cloudflare Zero Trust 中为该 Tunnel 配置好 Public Hostname，\n例如：argo.example.com）: '
-        read -r d
+        safe_read d || no_tty_die
         d="$(printf '%s' "$d" | tr -d '[:space:]')"
         if [ -z "$d" ]; then
             warn "域名不能为空，请重新输入"
@@ -200,7 +262,7 @@ prompt_token() {
     local t confirm
     while true; do
         printf 'Cloudflare Tunnel Token（在 Zero Trust → Networks → Tunnels 创建隧道后获取，\n通常以 "ey" 开头）。为避免泄露，粘贴后按回车确认，输入内容不会显示: '
-        read -rs t
+        safe_read -s t || no_tty_die
         printf '\n'
         t="$(printf '%s' "$t" | tr -d '[:space:]')"
         if [ -z "$t" ]; then
@@ -210,7 +272,7 @@ prompt_token() {
         if [[ "$t" != ey* ]]; then
             warn "Token 格式看起来不太对（通常以 \"ey\" 开头），请确认是否复制完整"
             printf '仍然使用该 Token？[y/N]: '
-            read -r confirm
+            safe_read confirm || no_tty_die
             case "$confirm" in
                 y|Y) ;;
                 *) continue ;;
@@ -627,6 +689,10 @@ uninstall_all() {
 cleanup_residue() {
     load_config
     log "开始清理 Argo 残留进程与缓存（不会删除本脚本，也不会影响当前正常运行的 Argo 服务）"
+    if [ -z "$TTY_SRC" ]; then
+        warn "当前环境没有可用的交互终端，为安全起见本次 cleanup 只会扫描并列出发现的内容，"
+        warn "不会自动删除/终止任何东西。如需实际清理，请在真实终端里直接运行：bash $(basename "$0") cleanup"
+    fi
     echo
 
     local active_pid=""
@@ -635,7 +701,7 @@ cleanup_residue() {
     # 1) 扫描残留 cloudflared 进程（排除当前受管 PID），逐个确认后终止
     log "第 1 步：扫描残留的 cloudflared 进程..."
     if command -v pgrep >/dev/null 2>&1; then
-        local pids pid cmd found=0 ans
+        local pids pid cmd found=0
         # 用 -x 按精确进程名匹配（而不是 -f 匹配整条命令行），避免误伤命令行里
         # 恰好包含 "cloudflared"/"tunnel" 字样的无关进程（例如某个正在编辑本脚本的编辑器）
         pids="$(pgrep -x cloudflared 2>/dev/null || true)"
@@ -645,17 +711,14 @@ cleanup_residue() {
             [ -z "$cmd" ] && continue
             found=1
             printf '发现进程 PID=%s：%s\n' "$pid" "$cmd"
-            printf '是否终止该进程？[y/N]: '
-            read -r ans
-            case "$ans" in
-                y|Y)
-                    kill -TERM "$pid" 2>/dev/null || true
-                    sleep 1
-                    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
-                    log "已终止 PID=$pid"
-                    ;;
-                *) log "跳过 PID=$pid" ;;
-            esac
+            if confirm_action "是否终止该进程？[y/N]: "; then
+                kill -TERM "$pid" 2>/dev/null || true
+                sleep 1
+                kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+                log "已终止 PID=$pid"
+            else
+                log "跳过 PID=$pid"
+            fi
         done
         [ "$found" = "0" ] && log "未发现残留 cloudflared 进程"
     else
@@ -676,12 +739,11 @@ cleanup_residue() {
     # 3) 可选清空日志文件
     log "第 3 步：日志文件..."
     if [ -f "$LOG_FILE" ]; then
-        printf '是否清空日志文件 %s？[y/N]: ' "$LOG_FILE"
-        read -r ans
-        case "$ans" in
-            y|Y) : > "$LOG_FILE"; log "日志已清空" ;;
-            *) log "保留日志文件" ;;
-        esac
+        if confirm_action "是否清空日志文件 $LOG_FILE？[y/N]: "; then
+            : > "$LOG_FILE"; log "日志已清空"
+        else
+            log "保留日志文件"
+        fi
     else
         log "日志文件不存在，跳过"
     fi
@@ -690,39 +752,35 @@ cleanup_residue() {
     # 4) 扫描历史 cloudflared 缓存目录（可能由手动操作或旧脚本产生的 cert.pem 等）
     log "第 4 步：扫描历史 cloudflared 缓存目录..."
     local cache_dirs=("$HOME/.cloudflared" "/etc/cloudflared" "/root/.cloudflared")
-    local d ans
+    local d
     for d in "${cache_dirs[@]}"; do
         [ -d "$d" ] || continue
         printf '发现缓存目录：%s（内容：%s）\n' "$d" "$(ls -A "$d" 2>/dev/null | tr '\n' ' ')"
-        printf '是否删除该目录？[y/N]: '
-        read -r ans
-        case "$ans" in
-            y|Y) rm -rf "$d"; log "已删除 $d" ;;
-            *) log "保留 $d" ;;
-        esac
+        if confirm_action "是否删除该目录？[y/N]: "; then
+            rm -rf "$d"; log "已删除 $d"
+        else
+            log "保留 $d"
+        fi
     done
     echo
 
     # 5) 扫描名称包含 argo/cloudflared 的其它 systemd 单元（排除当前受管单元）
     if is_root && command -v systemctl >/dev/null 2>&1; then
         log "第 5 步：扫描其它可能相关的 systemd 单元..."
-        local units u unit_path ans
+        local units u unit_path
         units="$(systemctl list-unit-files 2>/dev/null | grep -iE 'argo|cloudflared' | awk '{print $1}' || true)"
         if [ -n "$units" ]; then
             for u in $units; do
                 [ "$u" = "${SERVICE_NAME}.service" ] && continue
                 printf '发现单元：%s\n' "$u"
-                printf '是否停用并删除该单元？[y/N]: '
-                read -r ans
-                case "$ans" in
-                    y|Y)
-                        systemctl disable --now "$u" >/dev/null 2>&1 || true
-                        unit_path="$(systemctl show -p FragmentPath --value "$u" 2>/dev/null || true)"
-                        [ -n "$unit_path" ] && [ -f "$unit_path" ] && rm -f "$unit_path"
-                        log "已移除 $u"
-                        ;;
-                    *) log "保留 $u" ;;
-                esac
+                if confirm_action "是否停用并删除该单元？[y/N]: "; then
+                    systemctl disable --now "$u" >/dev/null 2>&1 || true
+                    unit_path="$(systemctl show -p FragmentPath --value "$u" 2>/dev/null || true)"
+                    [ -n "$unit_path" ] && [ -f "$unit_path" ] && rm -f "$unit_path"
+                    log "已移除 $u"
+                else
+                    log "保留 $u"
+                fi
             done
             systemctl daemon-reload >/dev/null 2>&1 || true
         else
